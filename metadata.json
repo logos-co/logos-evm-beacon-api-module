@@ -1,0 +1,23 @@
+{
+  "name": "beacon_api_module",
+  "version": "0.1.0",
+  "description": "Proxyable, fail-closed Ethereum Beacon API client. Per-chain consensus-layer provider lists with failover; serves the light-client routes the verified proxy reads. socks5h/Tor-ready.",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "cdylib",
+  "concurrency": "multi",
+  "max_workers": 8,
+  "category": "wallet",
+  "main": "beacon_api_module_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "BeaconApiModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}

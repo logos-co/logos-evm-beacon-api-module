@@ -1,0 +1,31 @@
+[package]
+name = "beacon_api_module"
+version = "1.0.0"
+edition = "2021"
+description = "Logos beacon_api module — proxyable, fail-closed Beacon API client (per-chain provider lists)."
+# Pin to the nix toolchain's rustc; resolver "3" then selects MSRV-compatible deps.
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# rustls-tls (pure-Rust TLS) + socks (socks5h, Tor-ready); blocking client — the
+# module methods are synchronous.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "blocking"] }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[dev-dependencies]
+tempfile = "3"
