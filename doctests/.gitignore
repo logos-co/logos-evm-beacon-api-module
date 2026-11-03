@@ -1,0 +1,6 @@
+# Track only the spec and its runner. Everything else here (built CLIs, the
+# daemon session, .lgx links, rendered outputs/) is a run artifact.
+*
+!.gitignore
+!*.test.yaml
+!run.sh
