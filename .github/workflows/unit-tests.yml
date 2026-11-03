@@ -1,0 +1,51 @@
+name: beacon-api-module Unit Tests
+
+# The pure core (config store, failover, staleness check, fail-closed proxy) against
+# local mock providers. `--no-default-features` drops the Logos glue, so nothing here
+# compiles the SDK or needs a module host.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: logos-co/setup-nix-cache-action@v1
+
+      # Cargo still resolves the manifest of the optional SDK path dependency, and
+      # Cargo.lock was resolved against the SDK logos-module-builder pins in flake.lock.
+      - name: Link the pinned logos-rust-sdk source
+        run: |
+          sdk=$(nix eval --raw --impure --expr \
+            '(builtins.getFlake (toString ./.)).inputs.logos-module-builder.inputs.logos-rust-sdk.outPath')
+          echo "logos-rust-sdk: $sdk"
+          ln -sfn "$sdk" logos-rust-sdk-src
+
+      # The nixpkgs rustc the module builds with (Cargo.toml's rust-version).
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --no-default-features
+        working-directory: rust-lib
+        run: cargo test --no-default-features --locked

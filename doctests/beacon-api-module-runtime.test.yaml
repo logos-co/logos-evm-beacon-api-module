@@ -1,0 +1,186 @@
+name: "Running the beacon-api Module Against logosctl"
+output: beacon-api-module-runtime.md
+release: ""
+
+intro: |
+  `logos-evm-beacon-api-module` is the **proxyable, fail-closed Ethereum Beacon API
+  client** for Logos, the consensus-layer twin of `eth_rpc_module`. It keeps a
+  provider list per chain, fails over between providers, and builds every request
+  through one fail-closed chokepoint: a chain set to `proxyRequired` with no usable
+  proxy **sends nothing** rather than reaching a provider in the clear.
+
+  This doc-test drives the module through a `logosctl` daemon:
+
+  1. Build the module, start a daemon and install the module into it.
+  2. Seed the default providers and read them back, per chain.
+  3. Add, disable and remove a provider.
+  4. Make one live light-client request against the Sepolia defaults.
+
+what_you_build: "This `beacon_api_module`, packaged as `.lgx`, installed into a `logosctl` session, and driven through its daemon."
+
+what_you_learn:
+  - How the default providers are seeded per chain, and read back
+  - How providers are added, disabled and removed by id
+  - How a light-client request fails over across a chain's providers
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled. Install from [nixos.org](https://nixos.org/download.html), then enable flakes:
+
+    ```bash
+    mkdir -p ~/.config/nix
+    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+    ```
+  - "**A Linux or macOS machine** with outbound HTTPS, for the one live light-client request."
+
+sections:
+  - title: "Build logosctl"
+    step: true
+    steps:
+      - title: "Build logosctl"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos
+        check_file: "logos/bin/logosctl"
+
+  - title: "Build and install the beacon-api module"
+    step: true
+    steps:
+      - title: "Build the module's .lgx"
+        run: "nix build 'github:logos-co/logos-evm-beacon-api-module{release}#lgx' --no-write-lock-file -o beacon-api-lgx"
+        code_block: |
+          nix build 'github:logos-co/logos-evm-beacon-api-module{release}#lgx' -o beacon-api-lgx
+        extra_run:
+          run: "ls beacon-api-lgx/*.lgx"
+      - title: "Start the daemon"
+        text: |
+          The session directory, `./session`, holds the daemon's config, its
+          installed modules and their data. `--detach` returns once the daemon
+          accepts commands.
+        # The bundled package downloader starts a storage node in $HOME; keep it
+        # out of the real one.
+        run: "mkdir -p home && HOME=\"$PWD/home\" ./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "logosctl daemon start --detach"
+        expect_contains:
+          - "Daemon started"
+      - title: "Install the .lgx"
+        text: |
+          A path ending in `.lgx` installs from disk, with no catalog involved. A
+          local build is unsigned, which the session's default policy accepts with
+          a warning. `-y` confirms, since there is no terminal to ask on.
+        run: "./logos/bin/logosctl --config-dir ./session install beacon-api-lgx/*.lgx -y"
+        code_block: "logosctl install beacon-api-lgx/*.lgx -y"
+        expect_contains:
+          - '"installed":["beacon_api_module"]'
+      - title: "Confirm the install"
+        run: "./logos/bin/logosctl --config-dir ./session package ls"
+        code_block: "logosctl package ls"
+        expect_contains:
+          - "beacon_api_module"
+
+  - title: "Seed and read the providers"
+    step: true
+    steps:
+      - title: "Load the module"
+        run: "./logos/bin/logosctl --config-dir ./session module load beacon_api_module"
+        code_block: "logosctl module load beacon_api_module"
+        expect_contains:
+          - "beacon_api_module"
+      - title: "Nothing is configured yet"
+        text: "`config_status` does no network I/O; a fresh session has no chains."
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module config_status"
+        code_block: "logosctl call beacon_api_module config_status"
+        expect_contains:
+          - '\"state\":\"unconfigured\"'
+      - title: "Seed the default providers"
+        text: |
+          Seeds each built-in provider once, only where absent: a default the user
+          removed is never re-added.
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module init_defaults"
+        code_block: "logosctl call beacon_api_module init_defaults"
+        expect_contains:
+          - '\"applied\":true'
+          - '\"11155111\":[\"lodestar\",\"nimbus-unstable\"]'
+      - title: "Three chains are configured"
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module config_status"
+        code_block: "logosctl call beacon_api_module config_status"
+        expect_contains:
+          - '\"state\":\"configured\"'
+          - '\"chainId\":1'
+          - '\"chainId\":11155111'
+          - '\"chainId\":560048'
+      - title: "Read the Sepolia config"
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module get_beacon_config 11155111"
+        code_block: "logosctl call beacon_api_module get_beacon_config 11155111"
+        expect_contains:
+          - '\"chainId\":11155111'
+          - "https://lodestar-sepolia.chainsafe.io"
+          - '\"proxyRequired\":false'
+
+  - title: "Add, disable and remove a provider"
+    step: true
+    steps:
+      - title: "Add a provider"
+        text: |
+          The argument is a JSON object, so it takes the `str:` prefix: `logosctl`
+          then passes it verbatim as the string the method expects. With no `id`
+          given, one is derived from the host.
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module add_provider 11155111 'str:{\"endpoint\":\"https://beacon.example.org\"}'"
+        code_block: |
+          logosctl call beacon_api_module add_provider 11155111 'str:{"endpoint":"https://beacon.example.org"}'
+        expect_contains:
+          - '\"ok\":true'
+          - '\"id\":\"beacon-example-org\"'
+      - title: "Disable it"
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module set_provider_enabled 11155111 beacon-example-org false"
+        code_block: "logosctl call beacon_api_module set_provider_enabled 11155111 beacon-example-org false"
+        expect_contains:
+          - '\"enabled\":false'
+      - title: "List the providers"
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module list_providers 11155111"
+        code_block: "logosctl call beacon_api_module list_providers 11155111"
+        expect_contains:
+          - '\"id\":\"lodestar\"'
+          - '\"id\":\"beacon-example-org\"'
+      - title: "Remove it"
+        run: "./logos/bin/logosctl --config-dir ./session call beacon_api_module remove_provider 11155111 beacon-example-org"
+        code_block: "logosctl call beacon_api_module remove_provider 11155111 beacon-example-org"
+        expect_contains:
+          - '\"removed\":\"beacon-example-org\"'
+      - title: "Sepolia is back to its defaults"
+        run: |
+          out=$(./logos/bin/logosctl --config-dir ./session call beacon_api_module get_beacon_config 11155111 2>&1)
+          printf '%s\n' "$out"
+          case "$out" in *beacon.example.org*) echo "provider still listed" ;; *lodestar*) echo "provider gone" ;; esac
+        code_block: "logosctl call beacon_api_module get_beacon_config 11155111"
+        expect_contains:
+          - "provider gone"
+
+  - title: "A live light-client request"
+    step: true
+    steps:
+      - title: "Fetch the optimistic update on Sepolia"
+        text: |
+          One request, named as libverifproxy names it. No provider is pinned
+          (`''`), so the chain's providers are tried in order until one answers;
+          `0` keeps the default 30 s deadline for the whole failover. `body` is the
+          provider's JSON, verbatim.
+        # Live network: retry a few times if every provider failed at once.
+        run: |
+          for i in 1 2 3; do
+            out=$(./logos/bin/logosctl --config-dir ./session call beacon_api_module lc_request 11155111 getLightClientOptimisticUpdate '{}' '' 0 2>&1)
+            case "$out" in *attested_header*) break ;; *) sleep 10 ;; esac
+          done
+          printf '%s\n' "$out"
+        code_block: "logosctl call beacon_api_module lc_request 11155111 getLightClientOptimisticUpdate '{}' '' 0"
+        expect_contains:
+          - '\"ok\":true'
+          - "attested_header"
+      - title: "Stop the daemon"
+        run: "./logos/bin/logosctl --config-dir ./session daemon stop || true"
+        code_block: "logosctl daemon stop"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
+        expect_contains:
+          - '"status":"not_running"'

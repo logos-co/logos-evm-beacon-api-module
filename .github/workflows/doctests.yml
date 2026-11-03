@@ -1,0 +1,225 @@
+name: beacon-api-module Doc-Tests
+
+# Runs this repo's executable doc-test(s) end-to-end via the shared `doctest`
+# CLI (github:logos-co/logos-doctest) on every PR and push to main, publishes a
+# rendered two-column HTML report to GitHub Pages, and (for PRs) posts the link.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# One-time setup for the published links to work:
+#   Repo Settings → Pages → Source: "Deploy from a branch", Branch: gh-pages /
+#   (root). The publish-report job creates the gh-pages branch on its first run.
+#
+# Reports are published to:
+#   https://<owner>.github.io/<repo>/                  (root index of all refs)
+#   https://<owner>.github.io/<repo>/main/<os>/        (pushes to main)
+#   https://<owner>.github.io/<repo>/pr-<N>/<os>/      (pull requests)
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: doctests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  doctests:
+    name: beacon-api-module doc-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # ATTIC_TOKEN_PUBLIC only exists in the public-cache environment; main
+    # jobs must opt into it to publish to the public cache.
+    environment: ${{ github.ref == 'refs/heads/main' && 'public-cache' || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix and set up the shared cache
+        uses: logos-co/setup-nix-cache-action@v1
+        with:
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
+          # Keep READING the old Cachix while the Attic caches fill up. The
+          # rust crate derivations this build needs are in Cachix and in no
+          # other cache -- so dropping it outright did not just cost cache
+          # hits, it turned "substitute a prebuilt path" into "build it from
+          # source", which fails. Credential-free: the cache is public, and
+          # nothing publishes here any more. Remove once Attic has the paths.
+          extra-nix-config: |
+            extra-substituters = https://logos-co.cachix.org
+            extra-trusted-public-keys = logos-co.cachix.org-1:12K8609ho1pCt0erUQrOrs/KmOuhWq/EhVwhzQRb35E=
+
+      # The commit under test. For PRs it's the head commit (so the spec's
+      # `{release}` placeholder resolves to THIS PR's code, not main). Fork PRs
+      # blank it (their head isn't in this repo) so the run falls back to main.
+      - name: Resolve commit under test
+        id: commit
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && \
+             [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run doc-tests
+        run: |
+          nix run github:logos-co/logos-doctest -- run \
+            doctests/beacon-api-module-runtime.test.yaml \
+            --verbose \
+            --continue-on-fail \
+            --release-for logos-evm-beacon-api-module=${{ steps.commit.outputs.sha }} \
+            --report "${{ runner.temp }}/doctest-report.html"
+
+      - name: Stage report for upload
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p report-out
+          if [ -f "${{ runner.temp }}/doctest-report.html" ]; then
+            cp "${{ runner.temp }}/doctest-report.html" report-out/index.html
+          else
+            echo "<h1>No report produced</h1>" > report-out/index.html
+          fi
+
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doctest-report-${{ matrix.os }}
+          path: report-out/index.html
+          if-no-files-found: warn
+
+  publish-report:
+    name: Publish report to GitHub Pages
+    needs: doctests
+    if: ${{ always() && github.event.pull_request.head.repo.fork != true }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    concurrency:
+      group: gh-pages-publish
+      cancel-in-progress: false
+
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Arrange this ref's reports
+        id: arrange
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="pr-${{ github.event.pull_request.number }}"
+          else
+            BASE="main"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+          mkdir -p "site/$BASE"
+          found=""
+          for os in ubuntu-latest macos-latest; do
+            src="artifacts/doctest-report-$os/index.html"
+            if [ -f "$src" ]; then
+              mkdir -p "site/$BASE/$os"
+              cp "$src" "site/$BASE/$os/index.html"
+              found="$found $os"
+            fi
+          done
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+
+          # Per-ref landing page linking each OS report.
+          {
+            echo "<!doctype html><meta charset=utf-8>"
+            echo "<title>logos-evm-beacon-api-module doc-test report — $BASE</title>"
+            echo "<style>body{font:16px system-ui;margin:40px;max-width:680px}a{color:#2563eb}</style>"
+            echo "<h1>logos-evm-beacon-api-module — $BASE</h1>"
+            echo "<p>commit <code>${GITHUB_SHA::7}</code> · <a href=\"../\">all reports</a></p><ul>"
+            for os in ubuntu-latest macos-latest; do
+              [ -d "site/$BASE/$os" ] && echo "<li><a href=\"./$os/\">$os</a></li>"
+            done
+            echo "</ul>"
+          } > "site/$BASE/index.html"
+
+      # The main index file: a root landing page listing every published ref
+      # (main + open PRs). Regenerated each run from the existing gh-pages
+      # contents plus the current ref, and deployed alongside (keep_files keeps
+      # the other refs' directories untouched).
+      - name: Build root index (main index file)
+        if: steps.arrange.outputs.found != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          refs=""
+          if git ls-remote --exit-code --heads "https://github.com/${{ github.repository }}.git" gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "https://github.com/${{ github.repository }}.git" existing 2>/dev/null || true
+            refs="$(ls -1 existing 2>/dev/null | grep -E '^(main|pr-[0-9]+)$' || true)"
+          fi
+          refs="$(printf '%s\n%s\n' "$refs" "${{ steps.arrange.outputs.base }}" | sort -u | grep -v '^$' || true)"
+          {
+            echo "<!doctype html><meta charset=utf-8>"
+            echo "<title>logos-evm-beacon-api-module doc-test reports</title>"
+            echo "<style>body{font:16px system-ui;margin:40px;max-width:680px}a{color:#2563eb}li{margin:.35em 0}code{background:#f3f4f6;padding:1px 5px;border-radius:4px}</style>"
+            echo "<h1>logos-evm-beacon-api-module doc-test reports</h1>"
+            echo "<p>Executable doc-test reports, latest run per ref. <a href=\"https://github.com/${{ github.repository }}\">source repository</a>.</p>"
+            echo "<ul>"
+            for ref in $refs; do
+              label="$ref"; [ "$ref" = "main" ] && label="main (latest)"
+              echo "<li><a href=\"./$ref/\">$label</a></li>"
+            done
+            echo "</ul>"
+          } > site/index.html
+
+      - name: Deploy to gh-pages
+        if: steps.arrange.outputs.found != ''
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          keep_files: true
+          commit_message: "Publish logos-evm-beacon-api-module doc-test report for ${{ steps.arrange.outputs.base }} (${{ github.sha }})"
+
+      - name: Comment on PR with report links
+        if: ${{ github.event_name == 'pull_request' && steps.arrange.outputs.found != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const base = "${{ steps.arrange.outputs.base }}";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const root = `https://${owner}.github.io/${repo}`;
+            const oses = "${{ steps.arrange.outputs.found }}".trim().split(/\s+/).filter(Boolean);
+            const links = oses.map(os => `- [\`${os}\` report](${root}/${base}/${os}/)`).join("\n");
+            const marker = "<!-- doctest-report-links -->";
+            const body =
+              `${marker}\n` +
+              `### 📊 beacon-api-module doc-test report\n\n` +
+              `This commit, run end-to-end and rendered with the commands and their output ` +
+              `(commit \`${context.sha.slice(0,7)}\`):\n\n` +
+              `${links}\n\n` +
+              `Index of all reports: ${root}/\n\n` +
+              `_Pages can take a minute to update after the run finishes._`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: context.issue.number, body });
+            }
