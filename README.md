@@ -21,15 +21,20 @@ one provider list, one proxy policy and one failover.
 - **Fail-closed proxying.** `proxy` (e.g. `socks5h://127.0.0.1:9050`) and `proxyRequired`
   per chain, through the same inlined `logos-net-proxy` chokepoint as `eth_rpc_module`.
 - **Defaults.** `init_defaults()` seeds providers that were probed to serve all four
-  light-client routes. Plain-http ones are fallbacks behind the https ones; they are safe
-  for light-client data, which the light client verifies, but `finalized_header` never
-  uses them, because a root over plain http could be swapped on the way.
+  light-client routes with the `Eth-Consensus-Version` header, which the verified proxy's
+  light client (nimbus) reads the fork from. Plain-http ones are fallbacks behind the
+  https ones; they are safe for light-client data, which the light client verifies, but
+  `finalized_header` never uses them, because a root over plain http could be swapped on
+  the way.
+- **Retired defaults.** publicnode was a default until 0.1.1. It sends no
+  `Eth-Consensus-Version` header, so the verified proxy could not decode its updates. A
+  store that seeded it drops it on load; an entry a user added for the same URL stays.
 
 | Chain | Default providers |
 |---|---|
-| mainnet (1) | publicnode, lodestar (chainsafe), nimbus-testing (http), nimbus-unstable (http) |
+| mainnet (1) | lodestar (chainsafe), nimbus-testing (http), nimbus-unstable (http) |
 | sepolia (11155111) | lodestar (chainsafe), nimbus-unstable (http) |
-| hoodi (560048) | publicnode, lodestar (chainsafe), nimbus-testing (http) |
+| hoodi (560048) | lodestar (chainsafe), nimbus-testing (http) |
 
 ## Methods
 
@@ -46,7 +51,7 @@ Every method answers a JSON string: `{ "ok": true, ... }` or
 | `list_providers(chain_id)` | Providers with their in-memory health (served, failures, last error, latency). |
 | `add_provider(chain_id, json)` | `{ endpoint, id?, enabled? }`; an omitted id is derived from the host. |
 | `remove_provider(chain_id, id)` / `set_provider_enabled(chain_id, id, bool)` | |
-| `provider_health(chain_id, id)` | Live check: does it serve the light-client API, and how many slots behind is it. |
+| `provider_health(chain_id, id)` | Live check: does it serve the light-client API, with the `Eth-Consensus-Version` header, and how many slots behind is it. |
 | `lc_request(chain_id, endpoint, params_json, provider, deadline_ms)` | One light-client request, named as libverifproxy names it (`getLightClientBootstrap`, `getLightClientUpdatesByRange`, `getLightClientOptimisticUpdate`, `getLightClientFinalityUpdate`). Answers `{ ok, provider, body, attempts }`, `body` verbatim. |
 | `finalized_header(chain_id)` | The finalized root from https providers only. A starting point to show a user, not a trust anchor. |
 | `raw_get(chain_id, path, provider)` | A GET under `/eth/v1/` or `/eth/v2/`, for diagnostics. |

@@ -1,6 +1,6 @@
 {
   "name": "beacon_api_module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Proxyable, fail-closed Ethereum Beacon API client. Per-chain consensus-layer provider lists with failover; serves the light-client routes the verified proxy reads. socks5h/Tor-ready.",
   "author": "Logos Core Team",
   "type": "core",
