@@ -15,7 +15,17 @@ struct Server {
     hits: Arc<Mutex<Vec<String>>>,
 }
 
+/// Answers with `Eth-Consensus-Version`, as lodestar and nimbus do.
 fn serve(route: impl Fn(&str) -> (u16, String, u64) + Send + Sync + 'static) -> Server {
+    serve_with("Eth-Consensus-Version: fulu\r\n", route)
+}
+
+/// Answers JSON without `Eth-Consensus-Version`, as publicnode does.
+fn serve_headerless(route: impl Fn(&str) -> (u16, String, u64) + Send + Sync + 'static) -> Server {
+    serve_with("", route)
+}
+
+fn serve_with(extra: &'static str, route: impl Fn(&str) -> (u16, String, u64) + Send + Sync + 'static) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let hits = Arc::new(Mutex::new(Vec::new()));
@@ -41,7 +51,7 @@ fn serve(route: impl Fn(&str) -> (u16, String, u64) + Send + Sync + 'static) -> 
                 std::thread::sleep(Duration::from_millis(delay));
                 let _ = write!(
                     s,
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
             });
@@ -121,10 +131,10 @@ fn defaults_seed_once_per_provider() {
     assert!(api.chain(1).unwrap().providers.iter().all(|p| p.source == ConfigSource::Builtin));
     assert!(api.init_defaults().is_empty(), "a second call writes nothing");
 
-    api.remove_provider(1, "publicnode").unwrap();
+    api.remove_provider(1, "nimbus-testing").unwrap();
     let mut reopened = BeaconApi::with_store(path);
     assert!(reopened.init_defaults().is_empty(), "a removed default stays removed");
-    assert!(reopened.chain(1).unwrap().providers.iter().all(|p| p.id != "publicnode"));
+    assert!(reopened.chain(1).unwrap().providers.iter().all(|p| p.id != "nimbus-testing"));
 }
 
 #[test]
@@ -133,7 +143,33 @@ fn defaults_never_clobber_a_callers_entry() {
     api.add_provider(1, &json!({ "id": "mine", "endpoint": "https://lodestar-mainnet.chainsafe.io/" })).unwrap();
     api.init_defaults();
     let ids: Vec<_> = api.chain(1).unwrap().providers.iter().map(|p| p.id.clone()).collect();
-    assert_eq!(ids, vec!["mine", "publicnode", "nimbus-testing", "nimbus-unstable"]);
+    assert_eq!(ids, vec!["mine", "nimbus-testing", "nimbus-unstable"]);
+}
+
+#[test]
+fn a_seeded_publicnode_is_dropped_on_load_and_a_callers_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("beacon.json");
+    let seeded = |id: &str, endpoint: &str| Provider { source: ConfigSource::Builtin, ..provider(id, endpoint) };
+    let old = json!({
+        "1": { "providers": [seeded("publicnode", "https://ethereum-beacon-api.publicnode.com"),
+                             seeded("lodestar", "https://lodestar-mainnet.chainsafe.io")] },
+        "560048": { "providers": [provider("publicnode", "https://ethereum-hoodi-beacon-api.publicnode.com"),
+                                  seeded("lodestar", "https://lodestar-hoodi.chainsafe.io")] },
+    });
+    std::fs::write(&path, old.to_string()).unwrap();
+    std::fs::write(dir.path().join("registry.json"), json!({ "offeredDefaults": ["1/publicnode"] }).to_string())
+        .unwrap();
+
+    let ids = |api: &BeaconApi, chain_id| -> Vec<String> {
+        api.chain(chain_id).unwrap().providers.iter().map(|p| p.id.clone()).collect()
+    };
+    let mut api = BeaconApi::with_store(path.clone());
+    assert_eq!(ids(&api, 1), vec!["lodestar"]);
+    assert_eq!(ids(&api, 560_048), vec!["publicnode", "lodestar"], "an external entry stays");
+    api.init_defaults();
+    assert!(api.chain(1).unwrap().providers.iter().all(|p| !p.endpoint.contains("publicnode")));
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("ethereum-beacon-api.publicnode.com"), "persisted");
 }
 
 #[test]
@@ -300,6 +336,23 @@ fn provider_health_reports_lag() {
     let p = plan(1, vec![provider("missing", &missing.base)]);
     let v = p.check_provider(&HealthBook::default(), "missing").unwrap();
     assert_eq!((v["servesLightClient"].as_bool(), v["error"].as_str()), (Some(false), Some("HTTP 404")));
+}
+
+#[test]
+fn provider_health_needs_the_consensus_version_header() {
+    let with = serve(|_| (200, head_update(0), 0));
+    let p = plan(1, vec![provider("with", &with.base)]);
+    let v = p.check_provider(&HealthBook::default(), "with").unwrap();
+    assert_eq!((v["servesLightClient"].as_bool(), v["healthy"].as_bool()), (Some(true), Some(true)));
+    assert_eq!(v["consensusVersion"], "fulu");
+
+    let without = serve_headerless(|_| (200, head_update(0), 0));
+    let p = plan(1, vec![provider("without", &without.base)]);
+    let health = HealthBook::default();
+    let v = p.check_provider(&health, "without").unwrap();
+    assert_eq!((v["servesLightClient"].as_bool(), v["healthy"].as_bool()), (Some(false), Some(false)));
+    assert!(v["error"].as_str().unwrap().contains("Eth-Consensus-Version"), "{v}");
+    assert!(health.get(1, "without").last_error.contains("Eth-Consensus-Version"));
 }
 
 #[test]

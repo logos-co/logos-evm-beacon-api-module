@@ -34,7 +34,8 @@ pub trait BeaconApiModule: Send + Sync + 'static {
     fn add_provider(&self, chain_id: i64, provider_json: String) -> String;
     fn remove_provider(&self, chain_id: i64, provider_id: String) -> String;
     fn set_provider_enabled(&self, chain_id: i64, provider_id: String, enabled: bool) -> String;
-    /// Live check of one provider: whether it serves the light-client API and its slot lag.
+    /// Live check of one provider: whether it serves the light-client API, with the
+    /// `Eth-Consensus-Version` header the verified proxy needs, and its slot lag.
     fn provider_health(&self, chain_id: i64, provider_id: String) -> String;
 
     /// One light-client request, named as libverifproxy's beacon transport names it:

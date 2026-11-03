@@ -59,19 +59,27 @@ pub struct BuiltinProvider {
     pub endpoint: &'static str,
 }
 
-/// Probed 2026-11-02: each serves all four light-client routes. Plain-http ones are fallbacks;
-/// [`BeaconApi::finalized_header`] never uses them.
+/// Probed 2026-11-03: each serves all four light-client routes with the `Eth-Consensus-Version`
+/// header. Plain-http ones are fallbacks; [`BeaconApi::finalized_header`] never uses them.
 pub const DEFAULT_PROVIDERS: &[BuiltinProvider] = &[
-    BuiltinProvider { chain_id: 1, id: "publicnode", endpoint: "https://ethereum-beacon-api.publicnode.com" },
     BuiltinProvider { chain_id: 1, id: "lodestar", endpoint: "https://lodestar-mainnet.chainsafe.io" },
     BuiltinProvider { chain_id: 1, id: "nimbus-testing", endpoint: "http://testing.mainnet.beacon-api.nimbus.team" },
     BuiltinProvider { chain_id: 1, id: "nimbus-unstable", endpoint: "http://unstable.mainnet.beacon-api.nimbus.team" },
     BuiltinProvider { chain_id: 11_155_111, id: "lodestar", endpoint: "https://lodestar-sepolia.chainsafe.io" },
     BuiltinProvider { chain_id: 11_155_111, id: "nimbus-unstable", endpoint: "http://unstable.sepolia.beacon-api.nimbus.team" },
-    BuiltinProvider { chain_id: 560_048, id: "publicnode", endpoint: "https://ethereum-hoodi-beacon-api.publicnode.com" },
     BuiltinProvider { chain_id: 560_048, id: "lodestar", endpoint: "https://lodestar-hoodi.chainsafe.io" },
     BuiltinProvider { chain_id: 560_048, id: "nimbus-testing", endpoint: "http://testing.hoodi.beacon-api.nimbus.team" },
 ];
+
+/// Once-default endpoints dropped from stores that seeded them. publicnode sends no
+/// `Eth-Consensus-Version`, which nimbus' light client needs to decode an update.
+pub const RETIRED_DEFAULTS: &[(u64, &str)] = &[
+    (1, "https://ethereum-beacon-api.publicnode.com"),
+    (560_048, "https://ethereum-hoodi-beacon-api.publicnode.com"),
+];
+
+/// The response header nimbus' light-client REST client reads the fork from.
+pub const CONSENSUS_VERSION: &str = "eth-consensus-version";
 
 /// Who wrote a provider entry. Reporting only; a caller cannot claim `default`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,6 +488,7 @@ impl Plan {
     }
 
     /// One provider, no failover: whether it serves the light-client API and how far behind it is.
+    /// Serving it includes the fork header: nimbus' light client reads the fork from nowhere else.
     pub fn check_provider(&self, health: &HealthBook, id: &str) -> Result<Value, BeaconError> {
         let p = self
             .cfg
@@ -490,22 +499,29 @@ impl Plan {
         let client = self.client()?;
         let req = LcRequest::Optimistic;
         let t0 = Instant::now();
-        let raw = get(&client, &p.endpoint, &req.path(), Duration::from_secs(self.cfg.timeout_secs));
+        let raw = get_with_fork(&client, &p.endpoint, &req.path(), Duration::from_secs(self.cfg.timeout_secs));
         let latency = t0.elapsed().as_millis() as u64;
         let mut out = json!({ "ok": true, "chainId": self.chain_id, "provider": p.id, "endpoint": p.endpoint,
                               "https": p.https(), "latencyMs": latency });
-        let slot = raw.as_ref().ok().and_then(|b| serde_json::from_str::<Value>(b).ok()).and_then(|v| update_slot(&v));
+        let slot =
+            raw.as_ref().ok().and_then(|(_, b)| serde_json::from_str::<Value>(b).ok()).and_then(|v| update_slot(&v));
         match (&raw, slot) {
-            (Ok(_), Some(slot)) => {
+            (Ok((Some(fork), _)), Some(slot)) => {
                 let lag = lag_slots(self.chain_id, slot, unix_now());
                 let stale = lag.is_some_and(|l| l > MAX_HEAD_LAG_SLOTS);
                 out["servesLightClient"] = json!(true);
+                out["consensusVersion"] = json!(fork);
                 out["slot"] = json!(slot);
                 out["lagSlots"] = json!(lag);
                 out["healthy"] = json!(!stale);
                 if stale {
                     out["error"] = json!(format!("{} slots behind the clock", lag.unwrap_or(0)));
                 }
+            }
+            (Ok((None, _)), Some(_)) => {
+                out["servesLightClient"] = json!(false);
+                out["healthy"] = json!(false);
+                out["error"] = json!("no Eth-Consensus-Version header, which the verified proxy's light client needs");
             }
             (Ok(_), None) => {
                 out["servesLightClient"] = json!(false);
@@ -586,6 +602,16 @@ impl Plan {
 
 /// One GET. Anything but a 200 whose body fits [`MAX_BODY`] is an error naming why.
 fn get(client: &reqwest::blocking::Client, base: &str, path: &str, timeout: Duration) -> Result<String, String> {
+    get_with_fork(client, base, path, timeout).map(|(_, body)| body)
+}
+
+/// [`get`], plus the [`CONSENSUS_VERSION`] header when the answer carried a non-empty one.
+fn get_with_fork(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<(Option<String>, String), String> {
     let resp = client
         .get(format!("{base}{path}"))
         .header(reqwest::header::ACCEPT, "application/json")
@@ -596,6 +622,13 @@ fn get(client: &reqwest::blocking::Client, base: &str, path: &str, timeout: Dura
     if !status.is_success() {
         return Err(format!("HTTP {}", status.as_u16()));
     }
+    let fork = resp
+        .headers()
+        .get(CONSENSUS_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
     let mut body = String::new();
     resp.take(MAX_BODY + 1)
         .read_to_string(&mut body)
@@ -603,7 +636,7 @@ fn get(client: &reqwest::blocking::Client, base: &str, path: &str, timeout: Dura
     if body.len() as u64 > MAX_BODY {
         return Err(format!("body larger than {MAX_BODY} bytes"));
     }
-    Ok(body)
+    Ok((fork, body))
 }
 
 fn describe(e: &reqwest::Error, timeout: Duration) -> String {
@@ -657,11 +690,27 @@ impl BeaconApi {
                 self.chains = m.into_iter().filter_map(|(k, v)| k.parse().ok().map(|id| (id, v))).collect();
             }
         }
+        if self.drop_retired_defaults() {
+            self.persist();
+        }
         if let Some(text) = self.registry_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) {
             if let Some(ids) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("offeredDefaults").cloned()) {
                 self.offered = serde_json::from_value(ids).unwrap_or_default();
             }
         }
+    }
+
+    /// Seeded entries of [`RETIRED_DEFAULTS`] go; a caller's own entry for the same URL stays.
+    fn drop_retired_defaults(&mut self) -> bool {
+        let mut changed = false;
+        for (chain_id, chain) in self.chains.iter_mut() {
+            let before = chain.providers.len();
+            chain.providers.retain(|p| {
+                p.source != ConfigSource::Builtin || !RETIRED_DEFAULTS.contains(&(*chain_id, p.endpoint.as_str()))
+            });
+            changed |= chain.providers.len() != before;
+        }
+        changed
     }
 
     fn persist(&self) {
